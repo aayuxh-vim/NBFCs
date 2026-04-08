@@ -55,6 +55,52 @@ export type Applicant = {
   residential_status?: string | null;
 };
 
+export type Application = {
+  application_id: number;
+  loan_id?: number | null;
+  applicant_id?: number | null;
+  product: string;
+  branch_id: string;
+  loan_amount: number;
+  loan_roi: number;
+  loan_tenure: number;
+  servicing_la: string;
+  application_date: string;
+  app_processing_duration: number;
+  app_status: string;
+  loan_type: string;
+  channel: string;
+  risk_score?: number | null;
+  risk_label?: string | null;
+};
+
+export type Document = {
+  document_id: number;
+  application_id: number;
+  applicant_id?: number | null;
+  doc_type: string;
+  file_url: string;
+  ocr_text?: string | null;
+  ocr_verified: boolean;
+  uploaded_at: string;
+};
+
+export type RiskResult = {
+  risk_score: number;
+  risk_label: string;
+  application_id?: number;
+};
+
+export type DashboardStats = {
+  total_leads: number;
+  total_applications: number;
+  pending_assessment: number;
+  approved: number;
+  rejected: number;
+  low_risk: number;
+  high_risk: number;
+};
+
 async function getAccessToken(): Promise<string | null> {
   // Lazy import to avoid bundling issues and circular deps.
   const { supabase } = await import("./supabaseClient");
@@ -93,19 +139,100 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function apiFetchMultipart<T>(
+  path: string,
+  formData: FormData
+): Promise<T> {
+  const token = await getAccessToken();
+  const res = await fetch(`${apiBaseUrl()}${path}`, {
+    method: "POST",
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: formData,
+  });
+  if (!res.ok) {
+    let msg = `Request failed (${res.status})`;
+    try {
+      const j = (await res.json()) as { error?: string };
+      if (j?.error) msg = j.error;
+    } catch {
+      // ignore
+    }
+    throw new Error(msg);
+  }
+  return (await res.json()) as T;
+}
+
 export const api = {
+  // Health
   health: () => apiFetch<{ ok: boolean }>("/api/health"),
+
+  // Leads
   listLeads: (q?: string) =>
     apiFetch<Lead[]>(
       `/api/leads${q ? `?q=${encodeURIComponent(q)}` : ""}`,
       { cache: "no-store" }
     ),
-  getLead: (leadId: string) => apiFetch<Lead>(`/api/leads/${encodeURIComponent(leadId)}`),
+  getLead: (leadId: string) =>
+    apiFetch<Lead>(`/api/leads/${encodeURIComponent(leadId)}`),
   createLead: (lead: Lead) =>
-    apiFetch<Lead>("/api/leads", { method: "POST", body: JSON.stringify(lead) }),
+    apiFetch<Lead>("/api/leads", {
+      method: "POST",
+      body: JSON.stringify(lead),
+    }),
   deleteLead: (leadId: string) =>
-    apiFetch<{ deleted: boolean }>(`/api/leads/${encodeURIComponent(leadId)}`, { method: "DELETE" }),
+    apiFetch<{ deleted: boolean }>(
+      `/api/leads/${encodeURIComponent(leadId)}`,
+      { method: "DELETE" }
+    ),
   listApplicantsForLead: (leadId: string) =>
-    apiFetch<Applicant[]>(`/api/leads/${encodeURIComponent(leadId)}/applicants`),
-};
+    apiFetch<Applicant[]>(
+      `/api/leads/${encodeURIComponent(leadId)}/applicants`
+    ),
 
+  // Applicants
+  listApplicants: () =>
+    apiFetch<Applicant[]>("/api/applicants", { cache: "no-store" }),
+  createApplicant: (applicant: Omit<Applicant, "applicant_id">) =>
+    apiFetch<Applicant>("/api/applicants", {
+      method: "POST",
+      body: JSON.stringify(applicant),
+    }),
+
+  // Applications
+  listApplications: () =>
+    apiFetch<Application[]>("/api/applications", { cache: "no-store" }),
+  getApplication: (id: number) =>
+    apiFetch<Application>(`/api/applications/${id}`),
+  createApplication: (
+    app: Omit<Application, "application_id" | "risk_score" | "risk_label">
+  ) =>
+    apiFetch<Application>("/api/applications", {
+      method: "POST",
+      body: JSON.stringify(app),
+    }),
+  updateApplicationStatus: (id: number, status: string) =>
+    apiFetch<Application>(`/api/applications/${id}/status`, {
+      method: "PATCH",
+      body: JSON.stringify({ app_status: status }),
+    }),
+
+  // Risk Assessment
+  assessRisk: (id: number) =>
+    apiFetch<RiskResult>(`/api/applications/${id}/assess`, { method: "POST" }),
+  predictRisk: (data: Record<string, unknown>) =>
+    apiFetch<RiskResult>("/api/risk-assess", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  // Documents
+  listDocuments: (applicationId: number) =>
+    apiFetch<Document[]>(`/api/documents/${applicationId}`),
+  uploadDocument: (formData: FormData) =>
+    apiFetchMultipart<Document>("/api/documents/upload", formData),
+
+  // Dashboard
+  getStats: () => apiFetch<DashboardStats>("/api/stats"),
+};

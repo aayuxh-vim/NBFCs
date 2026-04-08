@@ -6,3 +6,7 @@ python-dotenv
 email-validator
 pyjwt
 requests
+scikit-learn
+pandas
+joblib
+pdfplumber

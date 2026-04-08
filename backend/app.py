@@ -1,7 +1,13 @@
+import io
 import os
+import tempfile
 from datetime import date, datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
+
+import joblib
+import numpy as np
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -71,13 +77,14 @@ def _verify_bearer_token() -> dict[str, Any]:
         if not jwk:
             raise PermissionError("Unknown signing key")
 
-    public_key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
+    public_key = jwt.PyJWK(jwk).key
     # Supabase tokens typically have issuer: {SUPABASE_URL}/auth/v1
     issuer = _get_env("SUPABASE_URL").rstrip("/") + "/auth/v1"
+    alg = jwk.get("alg", "ES256")
     return jwt.decode(
         token,
         public_key,
-        algorithms=["RS256"],
+        algorithms=[alg, "RS256", "ES256"],
         options={"verify_aud": False},
         issuer=issuer,
     )
@@ -95,8 +102,10 @@ def _require_auth_for_api():
         _verify_bearer_token()
     except PermissionError as e:
         return _json_error(str(e), status=401)
-    except Exception:
-        return _json_error("Invalid token", status=401)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return _json_error(f"Invalid token: {str(e)}", status=401)
     return None
 
 
@@ -351,6 +360,235 @@ def get_application(application_id: int):
     if not res.data:
         return _json_error("Application not found", status=404)
     return jsonify(res.data)
+
+
+# --------------- Risk Assessment ---------------
+
+_MODEL_PATH = Path(__file__).parent / "risk_model.pkl"
+
+
+@lru_cache(maxsize=1)
+def _load_model():
+    if not _MODEL_PATH.exists():
+        raise RuntimeError("risk_model.pkl not found – run train_model.py first")
+    return joblib.load(_MODEL_PATH)
+
+
+def _predict_risk(data: dict[str, Any]) -> dict[str, Any]:
+    bundle = _load_model()
+    clf = bundle["model"]
+    emp_map: dict[str, int] = bundle["employment_map"]
+    feature_cols: list[str] = bundle["feature_cols"]
+
+    monthly_income = float(data.get("monthly_income", 0))
+    loan_amount = float(data.get("loan_amount", 0))
+    loan_tenure = int(data.get("loan_tenure", 1) or 1)
+    cibil_score = int(data.get("cibil_score", 0))
+    age = int(data.get("age", 0))
+    emp_type = str(data.get("employment_type", "salaried")).lower().strip()
+    emp_enc = emp_map.get(emp_type, 0)
+
+    emi_approx = loan_amount / max(loan_tenure, 1)
+    emi_to_income = emi_approx / max(monthly_income, 1)
+    debt_to_income = loan_amount / max(monthly_income * loan_tenure, 1)
+
+    row = {
+        "monthly_income": monthly_income,
+        "cibil_score": cibil_score,
+        "employment_type_enc": emp_enc,
+        "loan_amount": loan_amount,
+        "loan_tenure": loan_tenure,
+        "age": age,
+        "debt_to_income": debt_to_income,
+        "emi_to_income": emi_to_income,
+    }
+    X = np.array([[row[c] for c in feature_cols]])
+    proba = clf.predict_proba(X)[0]  # [P(high), P(low)]
+    pred = int(clf.predict(X)[0])
+    risk_score = round(float(proba[1]), 4)  # probability of Low Risk
+    risk_label = "Low Risk" if pred == 1 else "High Risk"
+    return {"risk_score": risk_score, "risk_label": risk_label}
+
+
+@app.post("/api/risk-assess")
+def risk_assess():
+    """Standalone risk assessment – pass applicant financials, get risk score."""
+    body = request.get_json(force=True)
+    try:
+        result = _predict_risk(body)
+    except Exception as e:
+        return _json_error(str(e), status=500)
+    return jsonify(result)
+
+
+@app.post("/api/applications/<int:application_id>/assess")
+def assess_application(application_id: int):
+    """Run risk model on an existing application and save the score."""
+    sb = get_supabase()
+    app_res = (
+        sb.table("application")
+        .select("*")
+        .eq("application_id", application_id)
+        .maybe_single()
+        .execute()
+    )
+    if not app_res.data:
+        return _json_error("Application not found", status=404)
+    app_row = app_res.data
+
+    # Try to get linked applicant for age/income
+    applicant_data: dict[str, Any] = {}
+    if app_row.get("applicant_id"):
+        ap_res = (
+            sb.table("applicant")
+            .select("*")
+            .eq("applicant_id", app_row["applicant_id"])
+            .maybe_single()
+            .execute()
+        )
+        if ap_res.data:
+            applicant_data = ap_res.data
+
+    risk_input = {
+        "monthly_income": applicant_data.get("monthly_income") or app_row.get("loan_amount", 0) / 20,
+        "cibil_score": applicant_data.get("cibil_score", 600),
+        "employment_type": applicant_data.get("employment_type", "salaried"),
+        "loan_amount": app_row.get("loan_amount", 0),
+        "loan_tenure": app_row.get("loan_tenure", 12),
+        "age": applicant_data.get("age", 30),
+    }
+    result = _predict_risk(risk_input)
+
+    sb.table("application").update(
+        {
+            "risk_score": result["risk_score"],
+            "risk_label": result["risk_label"],
+        }
+    ).eq("application_id", application_id).execute()
+
+    return jsonify({**result, "application_id": application_id})
+
+
+# --------------- Application Status ---------------
+
+
+@app.patch("/api/applications/<int:application_id>/status")
+def update_application_status(application_id: int):
+    body = request.get_json(force=True)
+    new_status = body.get("app_status")
+    if not new_status:
+        return _json_error("app_status is required")
+    sb = get_supabase()
+    res = (
+        sb.table("application")
+        .update({"app_status": new_status})
+        .eq("application_id", application_id)
+        .execute()
+    )
+    if res.data:
+        return jsonify(res.data[0])
+    return _json_error("Application not found", status=404)
+
+
+# --------------- Documents & OCR ---------------
+
+
+@app.post("/api/documents/upload")
+def upload_document():
+    """Upload a PDF, extract text with pdfplumber, store metadata."""
+    import pdfplumber
+
+    file = request.files.get("file")
+    if not file:
+        return _json_error("No file provided")
+
+    application_id = request.form.get("application_id")
+    applicant_id = request.form.get("applicant_id")
+    doc_type = request.form.get("doc_type", "other")
+
+    if not application_id:
+        return _json_error("application_id is required")
+
+    # Save temp file and extract text
+    ocr_text = ""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        file.save(tmp)
+        tmp_path = tmp.name
+
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            pages_text = []
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    pages_text.append(t)
+            ocr_text = "\n\n".join(pages_text)
+    except Exception:
+        ocr_text = "[Could not extract text]"
+    finally:
+        os.unlink(tmp_path)
+
+    # For now store file_url as a placeholder – real impl would upload to Supabase Storage
+    file_url = f"/uploads/{file.filename}"
+
+    sb = get_supabase()
+    doc_data = {
+        "application_id": int(application_id),
+        "doc_type": doc_type,
+        "file_url": file_url,
+        "ocr_text": ocr_text[:10000],  # cap length
+        "ocr_verified": bool(ocr_text and ocr_text != "[Could not extract text]"),
+    }
+    if applicant_id:
+        doc_data["applicant_id"] = int(applicant_id)
+
+    res = sb.table("document").insert(doc_data).execute()
+    if res.data:
+        return jsonify(res.data[0]), 201
+    return _json_error("Insert failed", status=500)
+
+
+@app.get("/api/documents/<int:application_id>")
+def list_documents(application_id: int):
+    sb = get_supabase()
+    res = (
+        sb.table("document")
+        .select("*")
+        .eq("application_id", application_id)
+        .order("uploaded_at", desc=True)
+        .execute()
+    )
+    return jsonify(res.data or [])
+
+
+# --------------- Dashboard Stats ---------------
+
+
+@app.get("/api/stats")
+def dashboard_stats():
+    sb = get_supabase()
+    leads = sb.table("lead").select("lead_id", count="exact").execute()
+    apps = sb.table("application").select("application_id,risk_label,app_status").execute()
+
+    app_rows = apps.data or []
+    total_apps = len(app_rows)
+    pending = sum(1 for a in app_rows if (a.get("risk_label") or "pending") == "pending")
+    approved = sum(1 for a in app_rows if a.get("app_status") == "Approved")
+    rejected = sum(1 for a in app_rows if a.get("app_status") == "Rejected")
+    low_risk = sum(1 for a in app_rows if a.get("risk_label") == "Low Risk")
+    high_risk = sum(1 for a in app_rows if a.get("risk_label") == "High Risk")
+
+    return jsonify(
+        {
+            "total_leads": leads.count or 0,
+            "total_applications": total_apps,
+            "pending_assessment": pending,
+            "approved": approved,
+            "rejected": rejected,
+            "low_risk": low_risk,
+            "high_risk": high_risk,
+        }
+    )
 
 
 if __name__ == "__main__":
