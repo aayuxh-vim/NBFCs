@@ -478,7 +478,52 @@ def update_application_status(application_id: int):
     new_status = body.get("app_status")
     if not new_status:
         return _json_error("app_status is required")
+
     sb = get_supabase()
+
+    # Disbursements go through the stored procedure — it validates status,
+    # risk label, amount ceiling, computes EMI, and writes disbursement_log
+    # atomically. All other status transitions use the normal update path.
+    if new_status == "Disbursed":
+        disburse_amount = body.get("disburse_amount")
+        if not disburse_amount:
+            # Fall back to the sanctioned loan_amount if not explicitly provided
+            app_res = (
+                sb.table("application")
+                .select("loan_amount")
+                .eq("application_id", application_id)
+                .maybe_single()
+                .execute()
+            )
+            if not app_res.data:
+                return _json_error("Application not found", status=404)
+            disburse_amount = app_res.data["loan_amount"]
+
+        actor = body.get("actor", "system")
+        try:
+            sb.rpc(
+                "sp_approve_and_disburse",
+                {
+                    "p_application_id": application_id,
+                    "p_disburse_amount": float(disburse_amount),
+                    "p_actor": actor,
+                },
+            ).execute()
+        except Exception as e:
+            # Supabase surfaces RAISE EXCEPTION messages in the error detail
+            return _json_error(str(e), status=422)
+
+        # Fetch and return the updated row so the response shape stays the same
+        updated = (
+            sb.table("application")
+            .select("*")
+            .eq("application_id", application_id)
+            .maybe_single()
+            .execute()
+        )
+        return jsonify(updated.data)
+
+    # ── Normal status transition (e.g. Under Review → Approved / Rejected) ──
     res = (
         sb.table("application")
         .update({"app_status": new_status})
@@ -566,27 +611,27 @@ def list_documents(application_id: int):
 
 @app.get("/api/stats")
 def dashboard_stats():
+    """Single aggregated query via fn_get_portfolio_summary() — no Python-side counting."""
     sb = get_supabase()
-    leads = sb.table("lead").select("lead_id", count="exact").execute()
-    apps = sb.table("application").select("application_id,risk_label,app_status").execute()
+    try:
+        res = sb.rpc("fn_get_portfolio_summary", {}).execute()
+    except Exception as e:
+        return _json_error(f"Stats query failed: {e}", status=500)
 
-    app_rows = apps.data or []
-    total_apps = len(app_rows)
-    pending = sum(1 for a in app_rows if (a.get("risk_label") or "pending") == "pending")
-    approved = sum(1 for a in app_rows if a.get("app_status") == "Approved")
-    rejected = sum(1 for a in app_rows if a.get("app_status") == "Rejected")
-    low_risk = sum(1 for a in app_rows if a.get("risk_label") == "Low Risk")
-    high_risk = sum(1 for a in app_rows if a.get("risk_label") == "High Risk")
-
+    row = (res.data or [{}])[0]
     return jsonify(
         {
-            "total_leads": leads.count or 0,
-            "total_applications": total_apps,
-            "pending_assessment": pending,
-            "approved": approved,
-            "rejected": rejected,
-            "low_risk": low_risk,
-            "high_risk": high_risk,
+            "total_leads":         int(row.get("total_leads", 0)),
+            "total_applications":  int(row.get("total_applications", 0)),
+            "pending_assessment":  int(row.get("pending_assessment", 0)),
+            "approved":            int(row.get("approved", 0)),
+            "rejected":            int(row.get("rejected", 0)),
+            "disbursed":           int(row.get("disbursed", 0)),
+            "low_risk":            int(row.get("low_risk", 0)),
+            "high_risk":           int(row.get("high_risk", 0)),
+            "total_loan_value":    float(row.get("total_loan_value", 0)),
+            "avg_loan_amount":     float(row.get("avg_loan_amount", 0)),
+            "avg_risk_score":      float(row.get("avg_risk_score", 0)),
         }
     )
 
